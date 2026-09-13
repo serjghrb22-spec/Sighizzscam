@@ -658,4 +658,222 @@ async def request_code(callback: CallbackQuery):
 
     await callback.message.answer(
         "⏳ <b>Ожидание кода...</b>\n\n"
-  
+          "Код будет отправлен в этот чат в течение нескольких минут.\n"
+        "Пожалуйста, не закрывай бота."
+    )
+
+    await notify_admin(
+        "📩 <b>Запрос кода</b>\n\n"
+        f"👤 Пользователь: <code>{callback.from_user.id}</code>\n"
+        f"🔗 Юзернейм: @{callback.from_user.username or '—'}\n"
+        f"📦 Товар ID: <b>{product_id}</b>\n\n"
+        "Отправь код пользователю вручную."
+    )
+
+
+# =========================
+# PURCHASES
+# =========================
+
+@router.callback_query(F.data == "purchases")
+async def purchases(callback: CallbackQuery):
+    await callback.answer()
+    con = await db()
+    try:
+        cur = await con.execute(
+            """
+            SELECT o.id, p.name, o.price, o.created_at
+            FROM orders o
+            JOIN products p ON p.id = o.product_id
+            WHERE o.user_id = ?
+            ORDER BY o.id DESC
+            LIMIT 20
+            """,
+            (callback.from_user.id,),
+        )
+        rows = await cur.fetchall()
+    finally:
+        await con.close()
+
+    if not rows:
+        await callback.message.edit_text(
+            "🧾 <b>Покупки</b>\n\nУ тебя пока нет покупок.",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    text = "🧾 <b>Последние покупки</b>\n\n"
+    for r in rows:
+        text += (
+            f"#{r['id']} — <b>{html.escape(r['name'])}</b>\n"
+            f"💵 {float(r['price']):.2f} USDT\n"
+            f"🕐 {html.escape(str(r['created_at'])[:19])}\n\n"
+        )
+
+    await callback.message.edit_text(text, reply_markup=back_keyboard())
+
+
+# =========================
+# SUPPORT
+# =========================
+
+@router.callback_query(F.data == "support")
+async def support(callback: CallbackQuery):
+    await callback.answer()
+    username = SUPPORT_USERNAME.lstrip("@")
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🆘 Написать в поддержку",
+            url=f"https://t.me/{username}",
+        )],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="home")],
+    ])
+
+    await callback.message.edit_text(
+        "🆘 <b>Поддержка</b>\n\n"
+        "Если возникла проблема — напиши нам.",
+        reply_markup=keyboard,
+    )
+
+
+# =========================
+# CHECK SUB
+# =========================
+
+@router.callback_query(F.data == "check_sub")
+async def check_sub(callback: CallbackQuery):
+    await callback.answer()
+    if await is_subscribed(callback.from_user.id):
+        await callback.message.edit_text(
+            "✅ Подписка подтверждена!",
+            reply_markup=main_keyboard(),
+        )
+    else:
+        await callback.message.answer("❌ Ты ещё не подписался на канал.")
+
+
+# =========================
+# ADMIN
+# =========================
+
+@router.message(Command("admin"))
+async def admin_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещён.")
+        return
+    await message.answer(
+        "🛠 <b>Админ-панель</b>",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "admin")
+async def admin_menu(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(
+        "🛠 <b>Админ-панель</b>",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+
+    con = await db()
+    try:
+        cur = await con.execute("SELECT COUNT(*) AS c FROM users")
+        users_count = (await cur.fetchone())["c"]
+
+        cur = await con.execute("SELECT COUNT(*) AS c FROM orders")
+        orders_count = (await cur.fetchone())["c"]
+
+        cur = await con.execute("SELECT COALESCE(SUM(price), 0) AS s FROM orders")
+        revenue = (await cur.fetchone())["s"]
+
+        cur = await con.execute("SELECT COALESCE(SUM(balance), 0) AS s FROM users")
+        balances = (await cur.fetchone())["s"]
+    finally:
+        await con.close()
+
+    await callback.message.edit_text(
+        "📊 <b>Статистика</b>\n\n"
+        f"👥 Пользователей: <b>{users_count}</b>\n"
+        f"🛒 Покупок: <b>{orders_count}</b>\n"
+        f"💰 Продаж: <b>{float(revenue):.2f} USDT</b>\n"
+        f"💳 Балансы: <b>{float(balances):.2f} USDT</b>",
+        reply_markup=back_keyboard("admin"),
+    )
+
+
+@router.callback_query(F.data == "admin_products")
+async def admin_products(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+
+    con = await db()
+    try:
+        cur = await con.execute(
+            """
+            SELECT p.id, p.name, p.price, COUNT(i.id) AS stock
+            FROM products p
+            LEFT JOIN inventory i
+                ON i.product_id = p.id AND i.sold = 0
+            GROUP BY p.id
+            ORDER BY p.id
+            """
+        )
+        rows = await cur.fetchall()
+    finally:
+        await con.close()
+
+    if not rows:
+        await callback.message.edit_text(
+            "📦 <b>Товары</b>\n\nПусто.",
+            reply_markup=back_keyboard("admin"),
+        )
+        return
+
+    text = "📦 <b>Товары</b>\n\n"
+    for r in rows:
+        text += (
+            f"#{r['id']} <b>{html.escape(r['name'])}</b>\n"
+            f"💵 {float(r['price']):.2f} USDT\n"
+            f"📦 В наличии: {r['stock']}\n\n"
+        )
+
+    await callback.message.edit_text(text, reply_markup=back_keyboard("admin"))
+
+
+# =========================
+# ERROR HANDLER
+# =========================
+
+@router.error()
+async def error_handler(event):
+    log.exception("Unhandled error", exc_info=event.exception)
+
+
+# =========================
+# MAIN
+# =========================
+
+async def main():
+    await init_db()
+    log.info("Bot starting...")
+    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        await crypto.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
